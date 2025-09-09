@@ -13,11 +13,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::pin::Pin;
 use std::sync::Arc;
 
+use dynamo_runtime::engine::{AsyncEngineContext, AsyncEngineStream};
+use futures::Stream;
 use pyo3::{exceptions::PyException, prelude::*};
 
 use crate::{engine::*, to_pyerr, CancellationToken};
+
+use futures::stream::StreamExt as FuturesStreamExt;
 
 pub use dynamo_llm::endpoint_type::EndpointType;
 pub use dynamo_llm::http::service::{error as http_error, service_v2};
@@ -167,6 +172,66 @@ impl HttpAsyncEngine {
     #[new]
     pub fn new(generator: PyObject, event_loop: PyObject) -> PyResult<Self> {
         Ok(PythonAsyncEngine::new(generator, event_loop)?.into())
+    }
+}
+
+struct ManyOutWithFirstItem<R: Data> {
+    opt_first_item: Option<R>,
+    stream: ManyOut<R>,
+}
+
+impl<R: Data> Unpin for ManyOutWithFirstItem<R> {}
+
+impl<R: Data> AsyncEngineContextProvider for ManyOutWithFirstItem<R> {
+    fn context(&self) -> Arc<dyn AsyncEngineContext> {
+        self.stream.context()
+    }
+}
+
+impl<R: Data> Stream for ManyOutWithFirstItem<R> {
+    type Item = R;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        if self.opt_first_item.is_some() {
+            let first_item = self.opt_first_item.take();
+            std::task::Poll::Ready(first_item)
+        } else {
+            let stream = &mut self.stream;
+            let pin = Pin::new(stream);
+            pin.poll_next(cx)
+        }
+    }
+}
+
+impl<R: Data> std::fmt::Debug for ManyOutWithFirstItem<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Modeled after the `Debug` implementation for `ResponseStream`
+        f.debug_struct("ManyOutWithFirstItem")
+            .field("ctx", &self.stream.context())
+            .finish()
+    }
+}
+
+impl<R: Data> AsyncEngineStream<R> for ManyOutWithFirstItem<R> {}
+
+async fn await_stream_first_item<Resp: Data>(
+    mut stream: ManyOut<Annotated<Resp>>,
+) -> Result<ManyOut<Annotated<Resp>>, Error> {
+    match FuturesStreamExt::next(&mut stream).await {
+        Some(first_item) => {
+            let stream_with_first_item = ManyOutWithFirstItem {
+                opt_first_item: Some(first_item),
+                stream,
+            };
+            Ok(Box::pin(stream_with_first_item))
+        }
+        None => Err(Error::new(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "Async generator stream ended before processing started",
+        ))),
     }
 }
 
